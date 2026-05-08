@@ -6,7 +6,7 @@ import streamlit.web.cli as stcli
 import pandas
 import PyPDF2
 import docx
-import openpyxl
+import openpyx
 import sqlite3
 # --------------------------------------
 
