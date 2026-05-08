@@ -1,4 +1,5 @@
 streamlit
-PyPDF2
 pandas
-# any other libraries your app uses
+PyPDF2>=3.0.0
+python-docx
+openpyxl
