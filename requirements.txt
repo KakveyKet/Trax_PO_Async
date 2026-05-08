@@ -1,0 +1,4 @@
+streamlit
+PyPDF2
+pandas
+# any other libraries your app uses
