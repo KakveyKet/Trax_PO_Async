@@ -1,0 +1,34 @@
+# Byte-compiled / Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment / virtualenv
+venv/
+env/
+.venv/
+
+# Distribution / build files
+build/
+dist/
+*.spec
+*.egg-info/
+
+# Database files
+*.db
+po_processing_log.db
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Ignore run scripts and executables
+/run_app
+/run_app.spec
+
+# Text files you don't want in Git
+text.txt
