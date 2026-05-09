@@ -109,7 +109,7 @@ def get_raw_master_file(filename):
         return row[0] if row else None
     except: return None
 
-# --- Auto-Sync Engine (STRICT PO + SIZE MAPPING) ---
+# --- Auto-Sync Engine (FLEXIBLE PO + SIZE MAPPING) ---
 def get_clean_col_name(col):
     """Safely cleans a column name to avoid hidden space issues."""
     return str(col).strip().upper().replace(' ', '')
@@ -134,7 +134,7 @@ def get_extracted_po_dictionary(history_ids):
     
     if df_extracted.empty: return {}
     
-    # Clean data to ensure perfect matching
+    # Clean data
     df_extracted['quantity'] = pd.to_numeric(df_extracted['quantity'].astype(str).str.replace(',', ''), errors='coerce')
     df_extracted['po_number'] = df_extracted['po_number'].astype(str).str.strip().str.upper()
     df_extracted['size'] = df_extracted['size'].fillna('').astype(str).str.strip().str.upper().str.replace(' ', '')
@@ -144,7 +144,6 @@ def get_extracted_po_dictionary(history_ids):
     # Group by BOTH PO and SIZE
     df_summed = df_extracted.groupby(['po_number', 'size'])['quantity'].sum().reset_index()
     
-    # Create dictionary with a tuple key: (PO, Size) -> Quantity
     summed_dict = {}
     for _, row in df_summed.iterrows():
         summed_dict[(row['po_number'], row['size'])] = row['quantity']
@@ -158,15 +157,25 @@ def sync_extracted_data_to_master(df_master, summed_dict):
     po_col = find_col_exact(df_master, ["PURCHASEORDER", "PO", "PONUMBER", "PONO.", "PONO"])
     size_col = find_col_exact(df_master, ["SIZE", "DIMENSION", "DIMENSIONS"])
     del_rem_col = find_col_exact(df_master, ["DELIVERREMAINDER", "DELIVERYREMAINDER"])
+    out_col_name = find_col_exact(df_master, ["OUTSTANDING"]) or 'OUTSTANDING'
     
     if '#inv' in df_master.columns: df_master['#inv'] = 0.0
     if del_rem_col and del_rem_col in df_master.columns:
         df_master[del_rem_col] = pd.to_numeric(df_master[del_rem_col].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
-    if 'OUTSTANDING ' in df_master.columns and del_rem_col: 
-        df_master['OUTSTANDING '] = df_master[del_rem_col]
+    if out_col_name in df_master.columns and del_rem_col: 
+        df_master[out_col_name] = df_master[del_rem_col]
+        
+    # If the master file completely lacks a size column, collapse all extracted sizes into sizeless
+    remaining_qty_pool = {}
+    if not size_col:
+        for (p, s), qty in summed_dict.items():
+            remaining_qty_pool[(p, "")] = remaining_qty_pool.get((p, ""), 0.0) + qty
+    else:
+        remaining_qty_pool = summed_dict.copy()
     
-    # 1. Count Active Rows per STRICT PO+SIZE combo
-    po_counts = {}
+    # 1. Count Active Rows per PO+SIZE AND per PO independently
+    po_size_counts = {}
+    po_only_counts = {}
     if po_col:
         for index, row in df_master.iterrows():
             po = str(row[po_col]).strip().upper()
@@ -174,11 +183,9 @@ def sync_extracted_data_to_master(df_master, summed_dict):
             size_val = "" if pd.isna(size_raw) else str(size_raw).strip().upper().replace(' ', '')
             delivery_rem = float(row[del_rem_col]) if del_rem_col else 0.0
             
-            key = (po, size_val)
             if delivery_rem != 0:
-                po_counts[key] = po_counts.get(key, 0) + 1
-    
-    remaining_qty_pool = summed_dict.copy()
+                po_size_counts[(po, size_val)] = po_size_counts.get((po, size_val), 0) + 1
+                po_only_counts[po] = po_only_counts.get(po, 0) + 1
     
     if po_col:
         for index, row in df_master.iterrows():
@@ -187,40 +194,53 @@ def sync_extracted_data_to_master(df_master, summed_dict):
             size_val = "" if pd.isna(size_raw) else str(size_raw).strip().upper().replace(' ', '')
             delivery_rem = float(row[del_rem_col]) if del_rem_col else 0.0
             
-            # STRICT Exact Match Target ONLY
-            target_key = (po, size_val)
-                
             fill_amount = 0.0
             updated = False
             
-            if target_key in remaining_qty_pool and remaining_qty_pool[target_key] > 0:
-                available_qty = remaining_qty_pool[target_key]
+            # Decrement active row counters as we iterate past them
+            if delivery_rem != 0:
+                if po in po_only_counts: po_only_counts[po] -= 1
+                if (po, size_val) in po_size_counts: po_size_counts[(po, size_val)] -= 1
+            
+            # PRIMARY RULE: Try to find an Exact Size Match
+            if (po, size_val) in remaining_qty_pool and remaining_qty_pool[(po, size_val)] > 0:
+                available_qty = remaining_qty_pool[(po, size_val)]
                 
-                if delivery_rem != 0:
-                    po_counts[target_key] = po_counts.get(target_key, 1) - 1
-                    
-                # Cascade Logic per specific PO+Size
-                if po_counts.get(target_key, 0) <= 0: 
+                # If this is the last row for this EXACT Size, dump everything
+                if po_size_counts.get((po, size_val), 0) <= 0: 
                     fill_amount = available_qty
                 else: 
                     fill_amount = min(available_qty, delivery_rem) if delivery_rem > 0 else 0
                     
-                remaining_qty_pool[target_key] -= fill_amount
+                remaining_qty_pool[(po, size_val)] -= fill_amount
+                updated = True
+                
+            # FALLBACK RULE: Try to find a "Sizeless" invoice for this PO
+            elif (po, "") in remaining_qty_pool and remaining_qty_pool[(po, "")] > 0:
+                available_qty = remaining_qty_pool[(po, "")]
+                
+                # If this is the last active row for the ENTIRE PO, dump everything
+                if po_only_counts.get(po, 0) <= 0: 
+                    fill_amount = available_qty
+                else: 
+                    fill_amount = min(available_qty, delivery_rem) if delivery_rem > 0 else 0
+                    
+                remaining_qty_pool[(po, "")] -= fill_amount
                 updated = True
 
             if updated:
                 df_master.at[index, '#inv'] = fill_amount
-                df_master.at[index, 'OUTSTANDING '] = delivery_rem - fill_amount
+                df_master.at[index, out_col_name] = delivery_rem - fill_amount
                 updates_made += 1
             else:
                 df_master.at[index, '#inv'] = 0.0
-                df_master.at[index, 'OUTSTANDING '] = delivery_rem
+                df_master.at[index, out_col_name] = delivery_rem
 
     # Formatting to .00
     if '#inv' in df_master.columns:
         df_master['#inv'] = df_master['#inv'].astype(float).map('{:.2f}'.format)
-    if 'OUTSTANDING ' in df_master.columns:
-        df_master['OUTSTANDING '] = df_master['OUTSTANDING '].astype(float).map('{:.2f}'.format)
+    if out_col_name in df_master.columns:
+        df_master[out_col_name] = df_master[out_col_name].astype(float).map('{:.2f}'.format)
     if del_rem_col and del_rem_col in df_master.columns:
         df_master[del_rem_col] = df_master[del_rem_col].astype(float).map('{:.2f}'.format)
                 
@@ -252,9 +272,17 @@ def update_excel_template_in_memory(raw_file_bytes, summed_dict):
     size_col = get_col_idx(["SIZE", "DIMENSION", "DIMENSIONS"])
     inv_col = get_col_idx(["#INV", "INV", "INVOICEQTY"])
     del_rem_col = get_col_idx(["DELIVERREMAINDER", "DELIVERYREMAINDER"])
-    out_col = get_col_idx(["OUTSTANDING", "OUTSTANDING "])
+    out_col = get_col_idx(["OUTSTANDING"])
 
-    po_counts = {}
+    remaining_qty_pool = {}
+    if not size_col:
+        for (p, s), qty in summed_dict.items():
+            remaining_qty_pool[(p, "")] = remaining_qty_pool.get((p, ""), 0.0) + qty
+    else:
+        remaining_qty_pool = summed_dict.copy()
+
+    po_size_counts = {}
+    po_only_counts = {}
     if po_col:
         for r in range(header_row + 1, ws.max_row + 1):
             po_raw = ws.cell(row=r, column=po_col).value
@@ -272,11 +300,9 @@ def update_excel_template_in_memory(raw_file_bytes, summed_dict):
                         elif raw_rem is not None: del_rem_val = float(raw_rem)
                     except: pass
                     
-                key = (po_val, size_val)
                 if del_rem_val != 0:
-                    po_counts[key] = po_counts.get(key, 0) + 1
-
-    remaining_qty_pool = summed_dict.copy()
+                    po_size_counts[(po_val, size_val)] = po_size_counts.get((po_val, size_val), 0) + 1
+                    po_only_counts[po_val] = po_only_counts.get(po_val, 0) + 1
     
     if po_col:
         for r in range(header_row + 1, ws.max_row + 1):
@@ -306,21 +332,34 @@ def update_excel_template_in_memory(raw_file_bytes, summed_dict):
                 c_out.value = del_rem_val
                 c_out.number_format = '0.00'
             
-            # STRICT Match
-            target_key = (po_val, size_val)
-            
             fill_amount = 0.0
             updated = False
             
-            if target_key in remaining_qty_pool and remaining_qty_pool[target_key] > 0:
-                available_qty = remaining_qty_pool[target_key]
+            if del_rem_val != 0:
+                if po_val in po_only_counts: po_only_counts[po_val] -= 1
+                if (po_val, size_val) in po_size_counts: po_size_counts[(po_val, size_val)] -= 1
+            
+            # PRIMARY RULE: Exact Size Match
+            if (po_val, size_val) in remaining_qty_pool and remaining_qty_pool[(po_val, size_val)] > 0:
+                available_qty = remaining_qty_pool[(po_val, size_val)]
                 
-                if del_rem_val != 0:
-                    po_counts[target_key] = po_counts.get(target_key, 1) - 1
-                
-                if po_counts.get(target_key, 0) <= 0: fill_amount = available_qty
+                if po_size_counts.get((po_val, size_val), 0) <= 0: fill_amount = available_qty
                 else: fill_amount = min(available_qty, del_rem_val) if del_rem_val > 0 else 0
                 
+                remaining_qty_pool[(po_val, size_val)] -= fill_amount
+                updated = True
+                
+            # FALLBACK RULE: Sizeless Invoice Pool
+            elif (po_val, "") in remaining_qty_pool and remaining_qty_pool[(po_val, "")] > 0:
+                available_qty = remaining_qty_pool[(po_val, "")]
+                
+                if po_only_counts.get(po_val, 0) <= 0: fill_amount = available_qty
+                else: fill_amount = min(available_qty, del_rem_val) if del_rem_val > 0 else 0
+                
+                remaining_qty_pool[(po_val, "")] -= fill_amount
+                updated = True
+            
+            if updated:
                 if inv_col: 
                     c_inv = ws.cell(row=r, column=inv_col)
                     c_inv.value = float(fill_amount)
@@ -329,9 +368,6 @@ def update_excel_template_in_memory(raw_file_bytes, summed_dict):
                     c_out = ws.cell(row=r, column=out_col)
                     c_out.value = float(del_rem_val - fill_amount)
                     c_out.number_format = '0.00'
-                
-                remaining_qty_pool[target_key] -= fill_amount
-                updated = True
 
     owner_col = col_map.get("OWNER")
     if owner_col: ws.delete_cols(owner_col)
@@ -551,6 +587,11 @@ elif page == PAGE_MASTER:
                             df_master = pd.read_csv(po_line_file, encoding='latin1')
                     else: df_master = pd.read_excel(po_line_file)
                     
+                    # --- NEW CLEANUP FIX ---
+                    # Strip hidden spaces from Excel headers so the database never crashes
+                    df_master.columns = [str(col).strip() for col in df_master.columns]
+                    # -----------------------
+                    
                     if 'QTY' in df_master.columns and 'File Name' in df_master.columns:
                         st.error("Oops! You accidentally uploaded an Extracted Data file here. Upload tracking reports only.")
                         st.stop()
@@ -629,7 +670,7 @@ elif page == PAGE_MASTER:
         
         if st.session_state.get('sync_active') and st.session_state.get('sync_file') == file_to_manage:
             with st.container(border=True):
-                st.markdown(f"### :material/task_alt: Auto-Synced Data (Exact Match PO + Size)")
+                st.markdown(f"### :material/task_alt: Auto-Synced Data (Smart Exact Match)")
                 
                 if not selected_history_ids:
                     st.error("Please select at least one Extraction Batch from 'Step 1' above before syncing.")
@@ -639,8 +680,8 @@ elif page == PAGE_MASTER:
                     
                     synced_df, updates_count = sync_extracted_data_to_master(file_data_df, summed_dict)
                     
-                    if updates_count > 0: st.success(f"Successfully mapped and calculated {updates_count} exact PO + Size lines!")
-                    else: st.warning("No matching PO numbers & Sizes were found in the selected extraction batches.")
+                    if updates_count > 0: st.success(f"Successfully mapped and calculated {updates_count} exact PO lines!")
+                    else: st.warning("No matching PO numbers / Sizes were found in the selected extraction batches.")
                         
                     st.data_editor(synced_df, use_container_width=True, hide_index=True, disabled=True)
                     
